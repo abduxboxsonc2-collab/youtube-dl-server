@@ -1,21 +1,12 @@
 import re
 import os
 import json
-import subprocess
 import time
 import yt_dlp
 import httpx
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
-
-# ---------- Start the PO‑Token sidecar in the background ----------
-# (Only starts once when the module loads)
-try:
-    subprocess.Popen(["node", "server.js"], cwd="/app/bgutil-provider/server")
-    time.sleep(3)   # give it time to initialise
-except Exception:
-    pass   # if it fails we still want the server to run (yt‑dlp will fall back)
 
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 COOKIEFILE = os.getenv("COOKIEFILE", "")
@@ -25,21 +16,45 @@ USER_AGENT = os.getenv(
 )
 COMBINED_FORMAT_MATCH = r"\[([^\+]+=[^\+]+)\+.*\]"
 
+# Public PO‑Token service – you can replace this with your own if needed
+POT_PROVIDER_URL = os.getenv("POT_PROVIDER_URL", "https://yt-dlp-pot-provider.vercel.app")
+
 
 class ErrorLogger:
     def __init__(self):
-        self.count = 0
         self.errors = []
         self.warnings = []
 
-    def debug(self, msg):
-        pass
+    def debug(self, msg): pass
+    def warning(self, msg): self.warnings.append(msg)
+    def error(self, msg): self.errors.append(msg)
 
-    def warning(self, msg):
-        self.warnings.append(msg)
 
-    def error(self, msg):
-        self.errors.append(msg)
+async def fetch_pot():
+    """Gets a fresh PO‑Token from the public provider (cached in memory)."""
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{POT_PROVIDER_URL}/get")
+            resp.raise_for_status()
+            data = resp.json()
+            return data["token"]
+    except Exception:
+        return None
+
+
+# simple in‑memory cache (expires after 5 minutes)
+_pot_cache = {"token": None, "timestamp": 0}
+
+
+async def get_pot():
+    now = time.time()
+    if _pot_cache["token"] and (now - _pot_cache["timestamp"]) < 300:
+        return _pot_cache["token"]
+    token = await fetch_pot()
+    if token:
+        _pot_cache["token"] = token
+        _pot_cache["timestamp"] = now
+    return token
 
 
 # ---------- Health check ----------
@@ -47,7 +62,7 @@ async def health(request):
     return JSONResponse({"status": "ok"})
 
 
-# ---------- /info (with bot‑bypass) ----------
+# ---------- /info ----------
 async def info(request):
     url = request.query_params.get("url")
     if not url:
@@ -77,10 +92,16 @@ async def info(request):
         "logger": logger,
         "no_color": True,
         "http_headers": {"User-Agent": user_agent},
-        "extractor_args": {"youtube": {"player_client": ["android_vr"]}},
-        "use_pot": True,                            # enable Proof‑of‑Origin token
-        "pot_url": "http://127.0.0.1:4416",         # sidecar address
     }
+
+    # Try to obtain a PO‑Token (may be None if provider is down)
+    pot_token = await get_pot()
+    if pot_token:
+        opts["extractor_args"] = {"youtube": {"player_client": ["android_vr"]}}
+        opts["use_pot"] = True
+        opts["pot_url"] = POT_PROVIDER_URL   # yt‑dlp can also take a URL directly
+        opts["pot_token"] = pot_token         # pass the token we already fetched
+
     if media_format:
         opts["format"] = media_format
     if COOKIEFILE:
@@ -97,7 +118,6 @@ async def info(request):
                     "warnings": logger.warnings,
                     "data": [],
                 })
-
             if not data:
                 return JSONResponse({
                     "success": False,
@@ -105,7 +125,6 @@ async def info(request):
                     "warnings": logger.warnings,
                     "data": [],
                 })
-
             entries = [data] if "entries" not in data else data["entries"]
             valid_entries = []
             for entry in entries:
@@ -113,7 +132,6 @@ async def info(request):
                     valid_entries.append(entry)
                 else:
                     logger.warning(f"No direct URL for {entry.get('title', 'unknown')}")
-
             if not valid_entries:
                 return JSONResponse({
                     "success": False,
@@ -121,7 +139,6 @@ async def info(request):
                     "warnings": logger.warnings,
                     "data": [],
                 })
-
             return JSONResponse({
                 "success": True,
                 "errors": logger.errors,
@@ -137,7 +154,7 @@ async def info(request):
         })
 
 
-# ---------- /search (unchanged) ----------
+# ---------- /search ----------
 async def search_handler(request):
     q = request.query_params.get("q")
     page_token = request.query_params.get("pageToken")
