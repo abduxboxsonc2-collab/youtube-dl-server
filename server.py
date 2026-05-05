@@ -1,12 +1,21 @@
 import re
 import os
 import json
+import subprocess
+import time
 import yt_dlp
 import httpx
-from yt_dlp import YoutubeDL   # <-- ADD THIS LINE
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
+
+# ---------- Start the PO‑Token sidecar in the background ----------
+# (Only starts once when the module loads)
+try:
+    subprocess.Popen(["node", "server.js"], cwd="/app/bgutil-provider/server")
+    time.sleep(3)   # give it time to initialise
+except Exception:
+    pass   # if it fails we still want the server to run (yt‑dlp will fall back)
 
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
 COOKIEFILE = os.getenv("COOKIEFILE", "")
@@ -35,18 +44,19 @@ class ErrorLogger:
 
 # ---------- Health check ----------
 async def health(request):
-    return JSONResponse({"status": "ok", "service": "youtube-dl-server"})
+    return JSONResponse({"status": "ok"})
 
 
-# ---------- /info (fixed) ----------
+# ---------- /info (with bot‑bypass) ----------
 async def info(request):
-    url = request.query_params.get("url")       # ← .get() instead of ["url"]
+    url = request.query_params.get("url")
     if not url:
         return JSONResponse({"success": False, "errors": ["Missing url parameter"]})
 
     media_format = request.query_params.get("format", "")
     user_agent = request.query_params.get("user-agent", USER_AGENT)
 
+    # format string cleanup
     if re.search(COMBINED_FORMAT_MATCH, media_format):
         in_brackets = False
         i = len(media_format)
@@ -67,57 +77,67 @@ async def info(request):
         "logger": logger,
         "no_color": True,
         "http_headers": {"User-Agent": user_agent},
+        "extractor_args": {"youtube": {"player_client": ["android_vr"]}},
+        "use_pot": True,                            # enable Proof‑of‑Origin token
+        "pot_url": "http://127.0.0.1:4416",         # sidecar address
     }
     if media_format:
         opts["format"] = media_format
     if COOKIEFILE:
         opts["cookiefile"] = COOKIEFILE
 
-    with YoutubeDL(opts) as ytdl:
-        try:
-            data = ytdl.extract_info(url, download=False)
-        except Exception as e:
+    try:
+        with yt_dlp.YoutubeDL(opts) as ytdl:
+            try:
+                data = ytdl.extract_info(url, download=False)
+            except Exception as e:
+                return JSONResponse({
+                    "success": False,
+                    "errors": [str(e)],
+                    "warnings": logger.warnings,
+                    "data": [],
+                })
+
+            if not data:
+                return JSONResponse({
+                    "success": False,
+                    "errors": logger.errors or ["No data returned"],
+                    "warnings": logger.warnings,
+                    "data": [],
+                })
+
+            entries = [data] if "entries" not in data else data["entries"]
+            valid_entries = []
+            for entry in entries:
+                if "url" in entry and entry["url"]:
+                    valid_entries.append(entry)
+                else:
+                    logger.warning(f"No direct URL for {entry.get('title', 'unknown')}")
+
+            if not valid_entries:
+                return JSONResponse({
+                    "success": False,
+                    "errors": logger.errors or ["No playable URL found"],
+                    "warnings": logger.warnings,
+                    "data": [],
+                })
+
             return JSONResponse({
-                "success": False,
-                "errors": [str(e)],
+                "success": True,
+                "errors": logger.errors,
                 "warnings": logger.warnings,
-                "data": [],
+                "data": valid_entries,
             })
-
-        if not data:
-            return JSONResponse({
-                "success": False,
-                "errors": logger.errors or ["No data returned"],
-                "warnings": logger.warnings,
-                "data": [],
-            })
-
-        entries = [data] if "entries" not in data else data["entries"]
-
-        valid_entries = []
-        for entry in entries:
-            if "url" in entry and entry["url"]:
-                valid_entries.append(entry)
-            else:
-                logger.warning(f"No direct URL for {entry.get('title', 'unknown')}")
-
-        if not valid_entries:
-            return JSONResponse({
-                "success": False,
-                "errors": logger.errors or ["No playable URL found"],
-                "warnings": logger.warnings,
-                "data": [],
-            })
-
+    except Exception as e:
         return JSONResponse({
-            "success": True,
-            "errors": logger.errors,
+            "success": False,
+            "errors": [str(e)],
             "warnings": logger.warnings,
-            "data": valid_entries,
+            "data": [],
         })
 
 
-# ---------- /search ----------
+# ---------- /search (unchanged) ----------
 async def search_handler(request):
     q = request.query_params.get("q")
     page_token = request.query_params.get("pageToken")
@@ -188,7 +208,6 @@ async def search_handler(request):
     })
 
 
-# ---------- Routes (root is now health check) ----------
 routes = [
     Route("/", endpoint=health, methods=["GET"]),
     Route("/info", endpoint=info, methods=["GET"]),
