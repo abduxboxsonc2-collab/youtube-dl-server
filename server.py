@@ -32,9 +32,17 @@ class ErrorLogger:
         self.errors.append(msg)
 
 
-# ---------- /info (with fix) ----------
+# ---------- Health check ----------
+async def health(request):
+    return JSONResponse({"status": "ok", "service": "youtube-dl-server"})
+
+
+# ---------- /info (fixed) ----------
 async def info(request):
-    url = request.query_params["url"]
+    url = request.query_params.get("url")       # ← .get() instead of ["url"]
+    if not url:
+        return JSONResponse({"success": False, "errors": ["Missing url parameter"]})
+
     media_format = request.query_params.get("format", "")
     user_agent = request.query_params.get("user-agent", USER_AGENT)
 
@@ -50,9 +58,6 @@ async def info(request):
                 in_brackets = True
             elif in_brackets and c == "+":
                 media_format = media_format[:i] + "][" + media_format[i + 1 :]
-
-    if not url:
-        return JSONResponse({"success": False, "errors": ["No URL specified"]})
 
     logger = ErrorLogger()
     opts = {
@@ -86,10 +91,8 @@ async def info(request):
                 "data": [],
             })
 
-        # Normalise: always work with a list
         entries = [data] if "entries" not in data else data["entries"]
 
-        # Filter out entries that don't have a direct URL
         valid_entries = []
         for entry in entries:
             if "url" in entry and entry["url"]:
@@ -113,7 +116,7 @@ async def info(request):
         })
 
 
-# ---------- /search (unchanged) ----------
+# ---------- /search ----------
 async def search_handler(request):
     q = request.query_params.get("q")
     page_token = request.query_params.get("pageToken")
@@ -184,8 +187,9 @@ async def search_handler(request):
     })
 
 
+# ---------- Routes (root is now health check) ----------
 routes = [
-    Route("/", endpoint=info, methods=["GET"]),
+    Route("/", endpoint=health, methods=["GET"]),
     Route("/info", endpoint=info, methods=["GET"]),
     Route("/search", endpoint=search_handler, methods=["GET"]),
 ]
