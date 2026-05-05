@@ -3,6 +3,7 @@ import os
 import json
 import yt_dlp
 import httpx
+from yt_dlp import YoutubeDL   # <-- ADD THIS LINE
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route
