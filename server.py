@@ -32,7 +32,7 @@ class ErrorLogger:
         self.errors.append(msg)
 
 
-# ---------- /info (unchanged core) ----------
+# ---------- /info (with fix) ----------
 async def info(request):
     url = request.query_params["url"]
     media_format = request.query_params.get("format", "")
@@ -70,25 +70,50 @@ async def info(request):
     with YoutubeDL(opts) as ytdl:
         try:
             data = ytdl.extract_info(url, download=False)
-        except Exception:
-            data = {}
-        success = bool(data)
-        if success:
-            data = [data["entries"]] if "entries" in data else [data]
-        else:
-            data = []
-
-        return JSONResponse(
-            {
-                "success": success,
-                "errors": logger.errors,
+        except Exception as e:
+            return JSONResponse({
+                "success": False,
+                "errors": [str(e)],
                 "warnings": logger.warnings,
-                "data": data,
-            }
-        )
+                "data": [],
+            })
+
+        if not data:
+            return JSONResponse({
+                "success": False,
+                "errors": logger.errors or ["No data returned"],
+                "warnings": logger.warnings,
+                "data": [],
+            })
+
+        # Normalise: always work with a list
+        entries = [data] if "entries" not in data else data["entries"]
+
+        # Filter out entries that don't have a direct URL
+        valid_entries = []
+        for entry in entries:
+            if "url" in entry and entry["url"]:
+                valid_entries.append(entry)
+            else:
+                logger.warning(f"No direct URL for {entry.get('title', 'unknown')}")
+
+        if not valid_entries:
+            return JSONResponse({
+                "success": False,
+                "errors": logger.errors or ["No playable URL found"],
+                "warnings": logger.warnings,
+                "data": [],
+            })
+
+        return JSONResponse({
+            "success": True,
+            "errors": logger.errors,
+            "warnings": logger.warnings,
+            "data": valid_entries,
+        })
 
 
-# ---------- /search (new) ----------
+# ---------- /search (unchanged) ----------
 async def search_handler(request):
     q = request.query_params.get("q")
     page_token = request.query_params.get("pageToken")
@@ -118,7 +143,6 @@ async def search_handler(request):
     items = data.get("items", [])
     video_ids = [i["id"]["videoId"] for i in items]
 
-    # Fetch durations
     durations = {}
     if video_ids:
         try:
@@ -142,23 +166,22 @@ async def search_handler(request):
     for item in items:
         snippet = item["snippet"]
         video_id = item["id"]["videoId"]
-        videos.append(
-            {
-                "videoId": video_id,
-                "title": snippet["title"],
-                "author": snippet["channelTitle"],
-                "thumbnail": (
-                    snippet["thumbnails"]["high"]["url"]
-                    if "high" in snippet["thumbnails"]
-                    else snippet["thumbnails"]["default"]["url"]
-                ),
-                "duration": durations.get(video_id, "Unknown"),
-            }
-        )
+        videos.append({
+            "videoId": video_id,
+            "title": snippet["title"],
+            "author": snippet["channelTitle"],
+            "thumbnail": (
+                snippet["thumbnails"]["high"]["url"]
+                if "high" in snippet["thumbnails"]
+                else snippet["thumbnails"]["default"]["url"]
+            ),
+            "duration": durations.get(video_id, "Unknown"),
+        })
 
-    return JSONResponse(
-        {"videos": videos, "nextPageToken": data.get("nextPageToken")}
-    )
+    return JSONResponse({
+        "videos": videos,
+        "nextPageToken": data.get("nextPageToken"),
+    })
 
 
 routes = [
