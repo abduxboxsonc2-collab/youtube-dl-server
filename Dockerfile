@@ -1,5 +1,5 @@
 FROM python:3-alpine
-RUN apk add --no-cache ffmpeg
+RUN apk add --no-cache ffmpeg deno   # ✅ deno added here
 RUN pip install yt-dlp starlette uvicorn httpx
 COPY . /app
 WORKDIR /app
