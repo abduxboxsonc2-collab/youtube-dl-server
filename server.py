@@ -9,14 +9,14 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "")
-COOKIEFILE = os.getenv("COOKIEFILE", "")
+COOKIEFILE = os.getenv("COOKIEFILE", "")          # /app/cookies.txt if you upload one
 USER_AGENT = os.getenv(
     "USER_AGENT",
     "Mozilla/5.0 (X11; Linux x86_64; rv:146.0) Gecko/20100101 Firefox/146.0",
 )
 COMBINED_FORMAT_MATCH = r"\[([^\+]+=[^\+]+)\+.*\]"
 
-# Public PO‑Token service – you can replace this with your own if needed
+# Public PO‑Token provider (optional – not strictly needed with cookies)
 POT_PROVIDER_URL = os.getenv("POT_PROVIDER_URL", "https://yt-dlp-pot-provider.vercel.app")
 
 
@@ -24,28 +24,21 @@ class ErrorLogger:
     def __init__(self):
         self.errors = []
         self.warnings = []
-
     def debug(self, msg): pass
     def warning(self, msg): self.warnings.append(msg)
     def error(self, msg): self.errors.append(msg)
 
 
 async def fetch_pot():
-    """Gets a fresh PO‑Token from the public provider (cached in memory)."""
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(f"{POT_PROVIDER_URL}/get")
             resp.raise_for_status()
-            data = resp.json()
-            return data["token"]
+            return resp.json()["token"]
     except Exception:
         return None
 
-
-# simple in‑memory cache (expires after 5 minutes)
 _pot_cache = {"token": None, "timestamp": 0}
-
-
 async def get_pot():
     now = time.time()
     if _pot_cache["token"] and (now - _pot_cache["timestamp"]) < 300:
@@ -57,12 +50,12 @@ async def get_pot():
     return token
 
 
-# ---------- Health check ----------
+# ---------- Health ----------
 async def health(request):
     return JSONResponse({"status": "ok"})
 
 
-# ---------- /info ----------
+# ---------- /info with multiple extraction attempts ----------
 async def info(request):
     url = request.query_params.get("url")
     if not url:
@@ -71,7 +64,7 @@ async def info(request):
     media_format = request.query_params.get("format", "")
     user_agent = request.query_params.get("user-agent", USER_AGENT)
 
-    # format string cleanup
+    # format cleanup (unchanged)
     if re.search(COMBINED_FORMAT_MATCH, media_format):
         in_brackets = False
         i = len(media_format)
@@ -85,76 +78,85 @@ async def info(request):
             elif in_brackets and c == "+":
                 media_format = media_format[:i] + "][" + media_format[i + 1 :]
 
-    logger = ErrorLogger()
-    opts = {
-        "quiet": True,
-        "noplaylist": True,
-        "logger": logger,
-        "no_color": True,
-        "http_headers": {"User-Agent": user_agent},
-    }
+    # ---------- List of strategies to try (borrowed from your old Node.js code) ----------
+    strategies = [
+        # (format, player_client)
+        ("best[height<=720]", "android"),
+        ("best[height<=480]", "ios"),
+        ("best",              "web"),
+    ]
 
-    # Try to obtain a PO‑Token (may be None if provider is down)
-    pot_token = await get_pot()
-    if pot_token:
-        opts["extractor_args"] = {"youtube": {"player_client": ["android_vr"]}}
-        opts["use_pot"] = True
-        opts["pot_url"] = POT_PROVIDER_URL   # yt‑dlp can also take a URL directly
-        opts["pot_token"] = pot_token         # pass the token we already fetched
+    last_errors = []
+    all_warnings = []
 
-    if media_format:
-        opts["format"] = media_format
-    if COOKIEFILE:
-        opts["cookiefile"] = COOKIEFILE
+    for fmt, client in strategies:
+        logger = ErrorLogger()
+        opts = {
+            "quiet": True,
+            "noplaylist": True,
+            "logger": logger,
+            "no_color": True,
+            "http_headers": {"User-Agent": user_agent},
+            "extractor_args": {"youtube": {"player_client": [client]}},
+        }
 
-    try:
-        with yt_dlp.YoutubeDL(opts) as ytdl:
-            try:
+        # If a cookie file exists, use it – this is the most reliable fix
+        if os.path.exists(COOKIEFILE) and os.path.getsize(COOKIEFILE) > 0:
+            opts["cookiefile"] = COOKIEFILE
+        else:
+            # Without cookies, try the PO‑Token if available
+            pot = await get_pot()
+            if pot:
+                opts["use_pot"] = True
+                opts["pot_url"] = POT_PROVIDER_URL
+                opts["pot_token"] = pot
+
+        if media_format:
+            opts["format"] = media_format
+        else:
+            opts["format"] = fmt
+
+        try:
+            with yt_dlp.YoutubeDL(opts) as ytdl:
                 data = ytdl.extract_info(url, download=False)
-            except Exception as e:
-                return JSONResponse({
-                    "success": False,
-                    "errors": [str(e)],
-                    "warnings": logger.warnings,
-                    "data": [],
-                })
-            if not data:
-                return JSONResponse({
-                    "success": False,
-                    "errors": logger.errors or ["No data returned"],
-                    "warnings": logger.warnings,
-                    "data": [],
-                })
-            entries = [data] if "entries" not in data else data["entries"]
-            valid_entries = []
-            for entry in entries:
-                if "url" in entry and entry["url"]:
-                    valid_entries.append(entry)
-                else:
-                    logger.warning(f"No direct URL for {entry.get('title', 'unknown')}")
-            if not valid_entries:
-                return JSONResponse({
-                    "success": False,
-                    "errors": logger.errors or ["No playable URL found"],
-                    "warnings": logger.warnings,
-                    "data": [],
-                })
+        except Exception as e:
+            last_errors.append(f"[{client}/{fmt}] {e}")
+            all_warnings.extend(logger.warnings)
+            continue
+
+        if not data:
+            last_errors.append(f"[{client}/{fmt}] No data returned")
+            continue
+
+        entries = [data] if "entries" not in data else data["entries"]
+        valid_entries = []
+        for entry in entries:
+            if "url" in entry and entry["url"]:
+                valid_entries.append(entry)
+            else:
+                logger.warning(f"No direct URL for {entry.get('title', 'unknown')}")
+
+        if valid_entries:
             return JSONResponse({
                 "success": True,
                 "errors": logger.errors,
                 "warnings": logger.warnings,
                 "data": valid_entries,
             })
-    except Exception as e:
-        return JSONResponse({
-            "success": False,
-            "errors": [str(e)],
-            "warnings": logger.warnings,
-            "data": [],
-        })
+        else:
+            last_errors.append(f"[{client}/{fmt}] No playable URL found")
+            all_warnings.extend(logger.warnings)
+
+    # All strategies failed
+    return JSONResponse({
+        "success": False,
+        "errors": last_errors,
+        "warnings": all_warnings,
+        "data": [],
+    })
 
 
-# ---------- /search ----------
+# ---------- /search (unchanged) ----------
 async def search_handler(request):
     q = request.query_params.get("q")
     page_token = request.query_params.get("pageToken")
